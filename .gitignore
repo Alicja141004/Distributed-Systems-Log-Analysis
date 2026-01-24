@@ -1,0 +1,44 @@
+# Build artifacts
+**/bin/
+**/obj/
+
+# Generated data
+**/logs*.csv
+**/logs*.stats.json
+**/*.log
+**/*.tmp
+**/*.bak
+
+# OS/IDE
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+.Trash/
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.tmp
+
+# Dotnet
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.pdb
+*.mdb
+*.pidb
+*.log
+project.lock.json
+project.fragment.lock.json
+artifacts/
+TestResults/
+*.nupkg
+*.snupkg
+
+# Rider/VS
+.vs/
+*.csproj.user

@@ -1,0 +1,11 @@
+{
+  "OutputPath": "logs.csv",
+  "TargetSizeGb": 1.0,
+  "Seed": 123,
+  "SystemCount": 6,
+  "ExpectedSpikeWindows": 10,
+  "ExpectedFailureWindows": 5,
+  "ExpectedTrendWindows": 5,
+  "AnomalyRate": 0.0005,
+  "AverageInterEventTimeSeconds": 0.5
+}
