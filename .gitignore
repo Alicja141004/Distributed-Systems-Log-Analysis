@@ -8,6 +8,7 @@
 **/*.log
 **/*.tmp
 **/*.bak
+logs_expanded_parquet/
 
 # OS/IDE
 .DS_Store
