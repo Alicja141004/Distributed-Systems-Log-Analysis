@@ -131,6 +131,8 @@ def main():
                 COUNT(*)     AS exact_total_events,
                 AVG(val)     AS exact_mean,
                 MEDIAN(val)  AS exact_median,
+                quantile_cont(val, 0.95) AS p95,
+                quantile_cont(val, 0.99) AS p99,
                 VAR_POP(val) AS exact_variance,
                 STDDEV(val)  AS exact_stddev
             FROM base_view
@@ -164,6 +166,7 @@ def main():
         total_events = stats["exact_total_events"]
         mean_val = float(stats["exact_mean"])
         median_val = float(stats["exact_median"])
+        p99_val = float(stats["p99"])
         var_val = float(stats["exact_variance"])
         std_val = float(stats["exact_stddev"])
 
@@ -191,12 +194,13 @@ def main():
             "Events": int(total_events),
             "Mean": mean_val,
             "Median": median_val,
+            "p99": p99_val,
             "Variance": var_val,
             "StdDev": std_val,
             "NormEntropy": norm_ent,
             "BalanceRatio": balance,
         })
-    
+
     res_df = pd.DataFrame(results).set_index("State")
     order = [s for s in STATE_ORDER if s in res_df.index]
     res_df = res_df.loc[order]
@@ -208,13 +212,13 @@ def main():
     print()
 
     # Nagłówek
-    print(f"  {'STAN':<10}│{'Events':>10} │{'Mean':>9} │{'Median':>8} │{'Variance':>13} │{'StdDev':>9} │{'NormEnt':>7} │{'BalRatio':>9} │ WNIOSEK")
+    print(f"  {'STAN':<10}│{'Events':>10} │{'Mean':>9} │{'Median':>8} │{'p99':>8} │{'Variance':>13} │{'StdDev':>9} │{'NormEnt':>7} │{'BalRatio':>9} │ WNIOSEK")
     print("  " + "-" * 130)
     
     # Dane referencyjne NORMAL
     norm = res_df.loc["NORMAL"] if "NORMAL" in res_df.index else None
-    norm_mean = norm["Mean"] if norm is not None else 1
     norm_ent = norm["NormEntropy"] if norm is not None else 0
+    norm_p99 = norm["p99"] if norm is not None else 100
 
     for state in order:
         r = res_df.loc[state]
@@ -225,18 +229,17 @@ def main():
         else:
             parts = []
             
-            # Analiza przesunięcia - porównanie średnich
-            # Jeśli średnia wzrosła > 10x -> Krytyczne, > 2x -> Istotne
-            mean_ratio = r["Mean"] / norm_mean if norm_mean > 0 else 1.0
+            # Krotność pogorszenia P99
+            p99_ratio = r["p99"] / norm_p99 if norm_p99 > 0 else 1.0
             
-            if mean_ratio > 10.0:
-                parts.append("Krytyczny skok opóź.")
-            elif mean_ratio > 2.0:
-                parts.append("Istotny wzrost opóź.")
-            elif mean_ratio < 0.8:
-                parts.append("Spadek średniej")
+            if p99_ratio > 10.0:
+                parts.append(f"Krytyczny skok P99")
+            elif p99_ratio > 4.0:
+                parts.append(f"Silna degradacja P99")
+            elif p99_ratio > 1.5:
+                parts.append(f"Wzrost opóźnień P99")
             else:
-                parts.append("Średnia w normie")
+                parts.append("P99 w normie")
 
             # Analiza chaosu - porównanie entropii
             # Wyższa entropia = bardziej płaski wykres (nieprzewidywalność)
@@ -248,7 +251,7 @@ def main():
             elif ent_diff < -0.15:
                 parts.append("Silna koncentracja")
             else:
-                parts.append("Podobny rozkład do NORMAL")
+                parts.append("Rozkład ~ NORMAL")
             
             # Balance ratio - nierównomierność
             if r["BalanceRatio"] > 1000:
@@ -259,12 +262,13 @@ def main():
             interp = ", ".join(parts)
 
         print(f"  {state:<10}│{int(r['Events']):>10,} │{r['Mean']:>9.1f} │{r['Median']:>8.1f} │"
-              f"{r['Variance']:>13.1f} │{r['StdDev']:>9.1f} │{r['NormEntropy']:>7.3f} │{r['BalanceRatio']:>9.1f} │ {interp}")
+              f"{r['p99']:>8.1f} │{r['Variance']:>13.1f} │{r['StdDev']:>9.1f} │{r['NormEntropy']:>7.3f} │{r['BalanceRatio']:>9.1f} │ {interp}")
 
     print("  " + "-" * 130)
     print("  LEGENDA:")
     print("  * NormEnt (0-1) - Stopień chaosu. 0=wszystko w jednym binie, 1=jednakowo we wszystkich")
     print("  * BalRatio      - Nierównomierność rozkładu (max_bin / median_bin)")
+    print("  * p99           - Percentyl 99 opóźnień")
 
     # 5.5. Wyświetlenie surowych liczników per bin
     print("\n[5.5/6] Surowe liczniki (events per bin):")
