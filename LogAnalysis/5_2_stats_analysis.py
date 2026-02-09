@@ -9,8 +9,19 @@ import seaborn as sns
 THIS_DIR = Path(__file__).resolve().parent
 PARQUET_DIR = THIS_DIR / "logs_expanded_parquet" # LogAnalysis/logs_expanded_parquet
 
-METRIC = "LatencyMs"
-USE_LOG_SCALE = True # Log-binning jest LEPSZY dla Latency
+METRICS_CONFIG = {
+    "LatencyMs":         {"scale_log": True}, # Log - (~20ms-10000ms)
+    "DiskQueueLength":   {"scale_log": True}, # Log - (~0-1 - 50-300+)
+    "RequestSizeBytes":  {"scale_log": True},  # Log - (~1-100 - 50000-200000+ bytes)
+    "ResponseSizeBytes": {"scale_log": True}, # Log - (~1-100 - 50000-200000+ bytes)
+    "LocalQps":          {"scale_log": False}, # Lin - (~10-50 - 100-500+), widać górki normalne vs spike
+    "CpuUsage":          {"scale_log": False}, # Lin - (0-100%), stały zakres
+    "NetworkErrors":     {"scale_log": False}  # Lin - (0 - kilka+)
+}
+
+SELECTED_METRIC = "LatencyMs"
+METRIC = SELECTED_METRIC
+USE_LOG_SCALE = METRICS_CONFIG[SELECTED_METRIC]["scale_log"]
 
 # Dla 1 GB (N ~ 1,68 mln) - reguła Sturgesa daje k ~ 21.68 -> 22
 # Dla 100 GB (N ~ 168 mln) - reguła Sturgesa daje k ~ 28.32 -> 29
@@ -81,9 +92,9 @@ def main():
     if max_val is None: max_val = 1000
 
     # Zabezpieczenie dla logarytmu (log(0) -> error)
-    if min_val <= 0: min_val = 0.001 if USE_LOG_SCALE else 0
+    if min_val <= 0: min_val = 1 if USE_LOG_SCALE else 0
 
-    print(f"   Zakres: {min_val} - {max_val} ms")
+    print(f"   Zakres: {min_val} - {max_val}")
 
     # Generowanie krawędzi "kubełków" (logarytmicznie lub liniowo)
     if USE_LOG_SCALE:
@@ -92,13 +103,17 @@ def main():
     else:
         bins = np.linspace(min_val, max_val, BINS_COUNT + 1)
 
-    print(f"   Skala: {'LOGARYTMICZNA (lepsza dla Latency)' if USE_LOG_SCALE else 'LINIOWA'}")
+    print(f"   Skala: {'LOGARYTMICZNA' if USE_LOG_SCALE else 'LINIOWA'}")
 
     # Przygotowanie definicji "kubełków" dla SQL (CASE WHEN...)
     case_parts = []
     for i in range(len(bins) - 1):
         low, high = bins[i], bins[i+1]
-        # Ostatni "kubełek" zamknięty z obu stron, żeby objąć max_val (który jest górną krawędzią ostatniego kubełka)
+        if i == 0 and USE_LOG_SCALE:
+             # Obejmuje 0 i wszystko do pierwszego progu logarytmicznego
+             metric_col = "val"
+             case_parts.append(f"WHEN {metric_col} < {high} THEN {i+1}")
+        # Ostatni "kubełek" zamknięty z obu stron, żeby objąć max_val
         if i == len(bins) - 2:
             case_parts.append(
                 f"WHEN val >= {low} AND val <= {high} THEN {i+1}")
@@ -131,7 +146,6 @@ def main():
                 COUNT(*)     AS exact_total_events,
                 AVG(val)     AS exact_mean,
                 MEDIAN(val)  AS exact_median,
-                quantile_cont(val, 0.95) AS p95,
                 quantile_cont(val, 0.99) AS p99,
                 VAR_POP(val) AS exact_variance,
                 STDDEV(val)  AS exact_stddev
@@ -172,7 +186,7 @@ def main():
 
         # Pobranie histogramu z kroku 3b)
         state_hist = hist_stats_df[hist_stats_df["SystemState"] == state]
-        # Budowanie wektora liczebności (pewność, że są wszystkie kubełki, nawet puste)
+        # Budowanie wektora liczebności (pewność, że są wszystkie "kubełki", nawet puste)
         counts_map = dict(zip(state_hist["bucket_idx"], state_hist["bucket_count"]))
         vector = np.array([counts_map.get(i, 0) for i in range(1, BINS_COUNT + 1)])
 
@@ -181,7 +195,7 @@ def main():
         ent = entropy(probs, base=2)
         norm_ent = ent / max_entropy if max_entropy > 0 else 0.0
 
-        # Balance ratio (max / median kubełków; fallback max / min_nonzero)
+        # Balance ratio (max / median "kubełków"; fallback max / min_nonzero)
         med_bin = np.median(vector)
         if med_bin > 0:
             balance = np.max(vector) / med_bin
@@ -223,7 +237,7 @@ def main():
     for state in order:
         r = res_df.loc[state]
     
-        # Logika wnioskowania oparta na relacji do średniej i entropii
+        # Logika wnioskowania oparta na relacji do p99, entropii i balance ratio względem stanu NORMAL
         if state == "NORMAL":
             interp = "Baseline (punkt odniesienia)"
         else:
@@ -258,6 +272,8 @@ def main():
                 parts.append(f"Ekstr. pik")
             elif r["BalanceRatio"] > 100:
                 parts.append(f"Silny pik")
+            else:
+                parts.append("Brak siln. pików")
             
             interp = ", ".join(parts)
 
@@ -274,7 +290,7 @@ def main():
     print("\n[5.5/6] Surowe liczniki (events per bin):")
     pivot_counts = hist_stats_df.pivot(index="bucket_idx", columns="SystemState", values="bucket_count").fillna(0).astype(int)
     
-    # Indeks + zakres (ms)
+    # Indeks + zakres
     bin_ranges = []
     for i in range(len(bins) - 1):
         bin_ranges.append(f"({i+1}) {int(bins[i])}-{int(bins[i+1])}")
@@ -327,7 +343,7 @@ def main():
             fontsize=14,
         )
         plt.ylabel("Prawdopodobieństwo (gęstość)", fontsize=12)
-        plt.xlabel(f"Indeks \"kubełka\" (zakres {METRIC} [ms])", fontsize=12)
+        plt.xlabel(f"Indeks \"kubełka\" (zakres {METRIC})", fontsize=12)
         plt.grid(True, alpha=0.3)
         plt.legend(title="Stan systemu", fontsize=11, loc="upper right")
         plt.tight_layout()
