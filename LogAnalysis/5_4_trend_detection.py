@@ -1,53 +1,53 @@
 """
-5.4 Trend detection (DuckDB + Python)
-
-Założenia:
-- okno czasowe: 5 minut
-- trend: min. 1 godzina (12 okien po 5 min)
-- próg nachylenia: +2 ms / okno 5-min => 0.4 ms / minutę
-- jakość dopasowania: R^2 >= 0.4
-- TrendWindow używane tylko do walidacji (nie do wykrywania)
+5.4 Trend detection (DuckDB + Python) — variable-length trends, anti-spike
 """
 
 from __future__ import annotations
-
 from pathlib import Path
 import json
-
 import duckdb
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
+# =============================================================================
+# 0. PARAMETRY I ŚCIEŻKI
+# =============================================================================
 
-# ŚCIEŻKI
+THIS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = THIS_DIR.parent
 
-THIS_DIR = Path(__file__).resolve().parent           # LogAnalysis/
-REPO_ROOT = THIS_DIR.parent                          # root projektu
-
-PARQUET_DIR = THIS_DIR / "logs_expanded_parquet"     # LogAnalysis/logs_expanded_parquet
-STATS_JSON = REPO_ROOT / "logs.csv.stats.json"       # root/logs.csv.stats.json
-
-# PARAMETRY
+PARQUET_DIR = THIS_DIR / "logs_expanded_parquet"
+STATS_JSON = REPO_ROOT / "logs.csv.stats.json"
 
 SOURCE_SYSTEM = "OrderService"
 METRIC = "LatencyMs"
 
 WINDOW_MINUTES = 5
-SEGMENT_WINDOWS = 12         # 12 * 5 min = 1 godzina
 
-# Regresja "czas → wartość" w minutach:
-# +2 ms / okno 5-min = +0.4 ms/min
-SLOPE_THRESHOLD_MS_PER_MIN = 0.4
 MIN_R2 = 0.4
+MIN_EVENTS_PER_WINDOW_WARN = 5
 
-# zasoby DuckDB
+# Trend logic
+MIN_SEG_WINDOWS = 6             # min 30 minut
+MAX_BAD_DIFF_RATIO = 0.10        # ~90% przyrostów dodatnich
+SPIKE_STEP_LOWER = 150
+SPIKE_STEP_UPPER = 400
+
+# Adaptive slope
+ADAPTIVE_SLOPE_PERCENTILE = 75
+ADAPTIVE_SLOPE_MIN_FLOOR = 0.2
+ADAPTIVE_SLOPE_MAX_CAP = 2.0
+
 THREADS = 8
 MEMORY_LIMIT_GB = 16
 TEMP_DIR = "/tmp/duckdb"
 
+# =============================================================================
+# 1. WCZYTANIE I AGREGACJA DO OKIEN 5-MIN
+# =============================================================================
 
-# 1) WCZYTANIE + OKNA CZASOWE
+print("\n=== [1] WCZYTANIE I AGREGACJA DANYCH ===")
 
 if not PARQUET_DIR.exists():
     raise RuntimeError(f"Nie znaleziono katalogu parquet: {PARQUET_DIR}")
@@ -57,10 +57,6 @@ con.execute("PRAGMA threads=?", [THREADS])
 con.execute("PRAGMA memory_limit=?", [f"{MEMORY_LIMIT_GB}GB"])
 con.execute("PRAGMA temp_directory=?", [TEMP_DIR])
 
-# Jedno zapytanie:
-# - agreguje do okien 5-min
-# - liczy średnią metryki
-# - liczy ile w oknie było TrendWindow=true (tylko walidacja)
 sql = f"""
 WITH base AS (
     SELECT
@@ -78,7 +74,7 @@ SELECT
     date_trunc('minute', Timestamp)
       - (EXTRACT(minute FROM Timestamp)::INT % {WINDOW_MINUTES}) * INTERVAL '1 minute'
         AS time_window,
-    AVG(value) AS avg_value,
+    median(value) AS med_value,
     COUNT(*) AS n_events,
     SUM(CASE WHEN TrendWindow THEN 1 ELSE 0 END) AS n_trendwindow
 FROM base
@@ -87,99 +83,159 @@ ORDER BY time_window
 """
 
 df = con.execute(sql, [SOURCE_SYSTEM]).df()
-
-print(f"\n[INFO] System={SOURCE_SYSTEM}, Metric={METRIC}")
-print(f"[INFO] ParquetDir={PARQUET_DIR}")
-print(f"[INFO] Liczba okien 5-min: {len(df)}")
-print(df.head(10).to_string(index=False))
-
-if df.empty or len(df) < SEGMENT_WINDOWS:
-    raise RuntimeError("Za mało danych/okien do wykrycia trendu (sprawdź SourceSystem / metrykę).")
-
 df["time_window"] = pd.to_datetime(df["time_window"])
 
+print(f"System: {SOURCE_SYSTEM}, Metryka: {METRIC}")
+print(f"Liczba okien 5-minutowych: {len(df)}")
+print(df.head(5).to_string(index=False))
 
-# 2) REGRESJA LINIOWA: CZAS -> WARTOŚĆ
+if df.empty:
+    raise RuntimeError("Brak danych po filtrze.")
+
+# Uzupełnienie osi czasu — BEZ interpolacji wartości
+df = df.sort_values("time_window").set_index("time_window")
+df = df.asfreq(f"{WINDOW_MINUTES}min")
+df["n_events"] = df["n_events"].fillna(0).astype(int)
+df["n_trendwindow"] = df["n_trendwindow"].fillna(0).astype(int)
+df = df.reset_index()
+
+median_events = float(np.median(df["n_events"].to_numpy()))
+if median_events < MIN_EVENTS_PER_WINDOW_WARN:
+    print(f"[WARN] Mało eventów na okno: mediana={median_events:.1f}")
+
+# =============================================================================
+# 2. REGRESJA LINIOWA
+# =============================================================================
 
 def linear_regression_time(time_windows: pd.Series, values: np.ndarray) -> tuple[float, float]:
-    """
-    Dopasowuje prostą: avg_value ~ czas (w minutach)
-    Zwraca:
-      slope_ms_per_min (ms/min)
-      r2
-    """
     t0 = time_windows.iloc[0]
-    # czas w minutach od początku segmentu
     X = ((time_windows - t0).dt.total_seconds() / 60.0).to_numpy().reshape(-1, 1)
     y = values.astype(float)
-
     model = LinearRegression()
     model.fit(X, y)
+    return float(model.coef_[0]), float(model.score(X, y))
 
-    slope_ms_per_min = float(model.coef_[0])
-    r2 = float(model.score(X, y))
-    return slope_ms_per_min, r2
+# =============================================================================
+# 3. ADAPTACYJNY PRÓG SLOPE (PRÓBKOWANIE)
+# =============================================================================
 
+print("\n=== [2] ADAPTACYJNY PRÓG SLOPE ===")
 
-# 3) WYKRYWANIE ODCINKÓW TRENDU (przesuwane okno 1h)
+valid = df[df["n_events"] > 0].copy().reset_index(drop=True)
+times = valid["time_window"]
+vals = valid["med_value"].to_numpy(dtype=float)
 
-avg_vals = df["avg_value"].to_numpy(dtype=float)
-tw_ratio_per_window = (df["n_trendwindow"] / df["n_events"]).fillna(0.0).to_numpy(dtype=float)
+rng = np.random.default_rng(42)
+all_slopes = []
 
+for _ in range(min(2000, len(valid) * 5)):
+    w = rng.integers(3, min(24, len(valid)))
+    i = rng.integers(0, len(valid) - w + 1)
+    slope, _ = linear_regression_time(times.iloc[i:i+w], vals[i:i+w])
+    all_slopes.append(slope)
+
+adaptive_thr = float(np.percentile(all_slopes, ADAPTIVE_SLOPE_PERCENTILE))
+adaptive_thr = max(adaptive_thr, ADAPTIVE_SLOPE_MIN_FLOOR)
+adaptive_thr = min(adaptive_thr, ADAPTIVE_SLOPE_MAX_CAP)
+
+print(f"Adaptacyjny próg slope: {adaptive_thr:.3f} ms/min")
+
+# =============================================================================
+# 4. DETEKCJA ODCINKÓW TRENDU (SEGMENTACJA → REGRESJA)
+# =============================================================================
+
+print("\n=== [3] DETEKCJA ODCINKÓW TRENDU ===")
+
+diffs = np.diff(vals)
 trend_segments = []
 
-for i in range(len(df) - SEGMENT_WINDOWS + 1):
-    seg_times = df["time_window"].iloc[i : i + SEGMENT_WINDOWS]
-    seg_vals = avg_vals[i : i + SEGMENT_WINDOWS]
+start = 0
+bad = 0
+count = 0
 
-    slope_ms_per_min, r2 = linear_regression_time(seg_times, seg_vals)
+for i in range(len(diffs)):
+    count += 1
 
-    if slope_ms_per_min >= SLOPE_THRESHOLD_MS_PER_MIN and r2 >= MIN_R2:
+    if diffs[i] <= 0:
+        bad += 1
+
+    # spike: nagły pojedynczy skok
+    if SPIKE_STEP_LOWER <= abs(diffs[i]) <= SPIKE_STEP_UPPER:
+        bad = count
+
+    if (bad / count) > MAX_BAD_DIFF_RATIO:
+        end = i
+        if (end - start + 1) >= MIN_SEG_WINDOWS:
+            seg_times = times.iloc[start:end+1]
+            seg_vals = vals[start:end+1]
+            slope, r2 = linear_regression_time(seg_times, seg_vals)
+
+            if slope >= adaptive_thr and r2 >= MIN_R2:
+                trend_segments.append({
+                    "start": seg_times.iloc[0],
+                    "end": seg_times.iloc[-1],
+                    "slope_ms_per_min": slope,
+                    "r2": r2,
+                })
+
+        start = i + 1
+        bad = 0
+        count = 0
+
+# domknięcie końcówki
+end = len(vals) - 1
+if (end - start + 1) >= MIN_SEG_WINDOWS:
+    seg_times = times.iloc[start:end+1]
+    seg_vals = vals[start:end+1]
+    slope, r2 = linear_regression_time(seg_times, seg_vals)
+
+    if slope >= adaptive_thr and r2 >= MIN_R2:
         trend_segments.append({
             "start": seg_times.iloc[0],
             "end": seg_times.iloc[-1],
-            "slope_ms_per_min": slope_ms_per_min,
+            "slope_ms_per_min": slope,
             "r2": r2,
-            # walidacja: średni udział TrendWindow w oknach tego segmentu
-            "trendwindow_ratio_avg": float(np.mean(tw_ratio_per_window[i : i + SEGMENT_WINDOWS])),
         })
 
 trend_df = pd.DataFrame(trend_segments)
-
-print("\n[WYNIK] Wykryte odcinki trendu (przed scalaniem):")
+print(f"Wykryto {len(trend_df)} segmentów trendu.")
 if trend_df.empty:
-    print("Brak wykrytych trendów.")
-    print("TIP: jeśli wiesz, że trend jest, obniż próg SLOPE_THRESHOLD_MS_PER_MIN do 0.2 albo MIN_R2 do 0.3.")
+    print("Brak trendów.")
     raise SystemExit(0)
-else:
-    print(trend_df.to_string(index=False))
+print(trend_df.head(5).to_string(index=False))
 
+# =============================================================================
+# 5. SCALANIE SEGMENTÓW
+# =============================================================================
 
-# 4) SCALANIE NACHODZĄCYCH ODCINKÓW
+print("\n=== [4] SCALANIE SEGMENTÓW ===")
+
+MERGE_GAP = pd.Timedelta(minutes=WINDOW_MINUTES)
 
 trend_df = trend_df.sort_values(["start", "end"]).reset_index(drop=True)
 merged = []
 cur = trend_df.iloc[0].to_dict()
 
-for j in range(1, len(trend_df)):
-    row = trend_df.iloc[j]
-    if row["start"] <= cur["end"]:
+for i in range(1, len(trend_df)):
+    row = trend_df.iloc[i].to_dict()
+    if row["start"] <= cur["end"] + MERGE_GAP:
         cur["end"] = max(cur["end"], row["end"])
-        cur["slope_ms_per_min"] = max(cur["slope_ms_per_min"], float(row["slope_ms_per_min"]))
-        cur["r2"] = max(cur["r2"], float(row["r2"]))
-        cur["trendwindow_ratio_avg"] = max(cur["trendwindow_ratio_avg"], float(row["trendwindow_ratio_avg"]))
+        cur["slope_ms_per_min"] = max(cur["slope_ms_per_min"], row["slope_ms_per_min"])
+        cur["r2"] = max(cur["r2"], row["r2"])
     else:
         merged.append(cur)
-        cur = row.to_dict()
+        cur = row
+
 merged.append(cur)
-
 merged_df = pd.DataFrame(merged)
+print(f"Po scaleniu: {len(merged_df)} segmentów.")
+print(merged_df.head(5).to_string(index=False))
 
-print("\n[WYNIK KOŃCOWY] Wykryte odcinki trendu (po scaleniu):")
-print(merged_df.to_string(index=False))
+# =============================================================================
+# 6. WALIDACJA (TrendWindow)
+# =============================================================================
 
-
-# 5) LICZBA EVENTÓW TRENDU
+print("\n=== [5] WALIDACJA I METRYKI ===")
 
 con.execute("DROP TABLE IF EXISTS trend_segments")
 con.execute("""
@@ -194,47 +250,38 @@ con.executemany(
     list(merged_df[["start", "end"]].itertuples(index=False, name=None))
 )
 
-trend_events_sql = f"""
-SELECT COUNT(*) AS trend_events
-FROM read_parquet(
-    '{str(PARQUET_DIR).replace("'", "''")}/**/*.parquet',
-    hive_partitioning=true
+confusion_sql = f"""
+WITH events AS (
+    SELECT
+        Timestamp,
+        TrendWindow AS truth,
+        EXISTS (
+            SELECT 1 FROM trend_segments s
+            WHERE Timestamp BETWEEN s.start_ts AND s.end_ts
+        ) AS pred
+    FROM read_parquet(
+        '{str(PARQUET_DIR).replace("'", "''")}/**/*.parquet',
+        hive_partitioning=true
+    )
+    WHERE SourceSystem = ?
 )
-WHERE SourceSystem = '{SOURCE_SYSTEM}'
-  AND EXISTS (
-      SELECT 1
-      FROM trend_segments s
-      WHERE Timestamp BETWEEN s.start_ts AND s.end_ts
-  )
+SELECT
+    SUM(CASE WHEN pred AND truth THEN 1 ELSE 0 END) AS tp,
+    SUM(CASE WHEN pred AND NOT truth THEN 1 ELSE 0 END) AS fp,
+    SUM(CASE WHEN NOT pred AND truth THEN 1 ELSE 0 END) AS fn,
+    SUM(CASE WHEN NOT pred AND NOT truth THEN 1 ELSE 0 END) AS tn
+FROM events
 """
 
-trend_events = int(con.execute(trend_events_sql).fetchone()[0])
-print(f'\n"TrendEvents" (nasza metoda): {trend_events}')
+tp, fp, fn, tn = map(int, con.execute(confusion_sql, [SOURCE_SYSTEM]).fetchone())
+precision = tp / (tp + fp) if tp + fp else 0.0
+recall = tp / (tp + fn) if tp + fn else 0.0
+f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+fpr = fp / (fp + tn) if (fp + tn) else 0.0
 
-
-# 6) WALIDACJA: ile eventów ma TrendWindow=true (tylko OrderService)
-
-trend_events_tw_sql = f"""
-SELECT COUNT(*) AS trend_events_tw
-FROM read_parquet(
-    '{str(PARQUET_DIR).replace("'", "''")}/**/*.parquet',
-    hive_partitioning=true
-)
-WHERE SourceSystem = '{SOURCE_SYSTEM}'
-  AND TrendWindow = true
-"""
-trend_events_tw = int(con.execute(trend_events_tw_sql).fetchone()[0])
-print(f'"TrendEvents_TrendWindow" (OrderService): {trend_events_tw}')
-
-
-# 7) PORÓWNANIE DO logs.csv.stats.json (dla wszystkich systemów)
+print(f"TP={tp} FP={fp} FN={fn} TN={tn}")
+print(f"Precision={precision:.4f} Recall={recall:.4f} F1={f1:.4f} FPR={fpr:.4f}")
 
 if STATS_JSON.exists():
     stats = json.loads(STATS_JSON.read_text(encoding="utf-8"))
-    print(f'\n[STATS.JSON] znaleziono: {STATS_JSON}')
-    print(f'[STATS.JSON] TrendEvents (global): {stats.get("TrendEvents")}')
-else:
-    print(f"\n[STATS.JSON] Nie znaleziono pliku: {STATS_JSON}")
-
-
-# Nasza metoda wykrywa ~57% eventów trendowych oznaczonych przez generator dla OrderService.
+    print(f"[STATS.JSON] TrendEvents (global): {stats.get('TrendEvents')}")
