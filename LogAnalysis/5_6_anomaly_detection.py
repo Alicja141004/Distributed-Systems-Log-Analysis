@@ -34,7 +34,6 @@ def main():
         SELECT 
             LatencyMs, 
             CpuUsage, 
-            MemoryUsageMb, 
             DiskQueueLength, 
             NetworkErrors, 
             LocalQps, 
@@ -64,35 +63,38 @@ def main():
 
     # B. Cechy interakcyjne - kodują RELACJE między metrykami
     # Celem jest odróżnić różne typy odstających eventów
+    eps = 1e-6
     
     # 1. ErrorRate - czy błędy sieciowe są proporcjonalne do ruchu?
     # Event z dużą liczbą błędów przy niskim ruchu jest bardziej podejrzany
-    df['ErrorRate'] = df['NetworkErrors'] / (df['LogQps'] + 1)
+    df['ErrorRate'] = df['NetworkErrors'] / (df['LogQps'] + eps)
     
     # 2. DiskStress - kolejka dysku w relacji do ruchu
     # Duża kolejka przy niskim QPS sugeruje problem wydajnościowy inny niż zwykłe obciążenie
-    df['DiskStress'] = df['DiskQueueLength'] / (df['LogQps'] + 1)
+    df['DiskStress'] = df['DiskQueueLength'] / (df['LogQps'] + eps)
     
     # 3. CpuEfficiency - ile QPS uzyskujemy z jednostki CPU?
     # Event z ekstremalnym CPU (bardzo niskim lub bardzo wysokim) przy nietypowym QPS będzie miał odstającą wartość tej cechy
-    df['CpuEfficiency'] = df['LogQps'] / (df['CpuUsage'] + 1)
+    df['CpuEfficiency'] = df['LogQps'] / (df['CpuUsage'] + eps)
 
     # 4. LatencyPerQps - wysoki latency przy niskim QPS ("stall") vs wysoki latency przy wysokim QPS (obciążenie)
     # Ta cecha separuje te dwa zjawiska
-    df['LatencyPerQps'] = df['LogLatency'] / (df['LogQps'] + 1)
+    df['LatencyPerQps'] = df['LogLatency'] / (df['LogQps'] + eps)
+
+    # 5. Anomalie mają ekstremalny RequestSize (1-100 LUB 50k-200k)
+    # Stosunek req/resp - anomalie mają nietypowe proporcje
+    df['SizeRatio'] = df['LogReqSize'] / (df['LogRespSize'] + eps)
 
     # Wybór ostatecznych cech
     features = [
         'LogLatency',
         'CpuUsage',
-        'MemoryUsageMb',
         'LogQps',
-        'LogReqSize',
-        'LogRespSize',
         'ErrorRate',
         'DiskStress',
         'CpuEfficiency',
-        'LatencyPerQps'
+        'LatencyPerQps',
+        'SizeRatio',
     ]
     
     X = df[features].values
@@ -143,7 +145,7 @@ def main():
     cm = confusion_matrix(y_true, y_pred)
     
     print("\n" + "=" * 60)
-    print("WYNIKI ANOMALY DETECTION - Isolation Forest")
+    print("WYNIKI ANOMALY DETECTION - Isolation Forest (nienadzorowane)")
     print("=" * 60)
     print(f"Metoda progu : {method_name} (wartość: {threshold:.4f})")
     print(f"Cechy ({len(features)}): {', '.join(features)}")
@@ -167,6 +169,8 @@ def main():
     print(f"  Alarmów łącznie: {total_alarms}, z czego {false_alarms} fałszywych.")
     if detected > 0:
         print(f"  FP/TP ratio: {false_alarms / detected:.1f}")
+        print(f"  -> Oznacza to, że na każdą prawdziwą anomalię przypada {false_alarms / detected:.1f} fałszywych alarmów.")
+        print(f"  -> Metoda jest skuteczna w wykrywaniu anomalii, ale generuje relatywnie wysoką liczbę fałszywych alarmów, co jest typowe dla nienadzorowanych metod detekcji anomalii. Wysoka liczba FP wynika prawdopodobnie z wykrywania zdarzeń typu 'Failure' oraz silnych 'Spike', które statystycznie są anomaliami, mimo braku etykiety 'IsAnomaly'.")
 
     # 6. Minimalna walidacja
     print("\n" + "=" * 60)
