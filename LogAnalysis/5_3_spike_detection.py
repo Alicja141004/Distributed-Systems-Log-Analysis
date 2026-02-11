@@ -122,14 +122,55 @@ def main():
     con.execute("PRAGMA threads=?", [THREADS])
     con.execute("PRAGMA memory_limit=?", [f"{MEMORY_LIMIT_GB}GB"])
 
-    # Liczba wierszy -> decyzja czy ewaluacja na całych danych czy próbce
-    total_rows = con.execute(
+    # Wczytanie bazowe + split czasowy (train/validation)
+    con.execute(
         f"""
-        SELECT COUNT(*)
+        CREATE OR REPLACE TEMP VIEW events_all AS
+        SELECT
+          Timestamp,
+          try_cast(LatencyMs AS DOUBLE) AS LatencyMs,
+          try_cast(CpuUsage AS DOUBLE) AS CpuUsage,
+          try_cast(LocalQps AS DOUBLE) AS LocalQps,
+          CAST(IsSpikeByLatency AS BOOLEAN) AS IsSpikeByLatency,
+          CAST(IsSpikeByCpu AS BOOLEAN) AS IsSpikeByCpu,
+          CAST(IsSpikeByQps AS BOOLEAN) AS IsSpikeByQps
         FROM read_parquet('{str(PARQUET_DIR)}/**/*.parquet', hive_partitioning=true)
         WHERE LatencyMs IS NOT NULL AND CpuUsage IS NOT NULL AND LocalQps IS NOT NULL
+          AND Timestamp IS NOT NULL
         """
+    )
+
+    total_rows = con.execute("SELECT COUNT(*) FROM events_all").fetchone()[0]
+
+    split_ratio = 0.8
+    cutoff_ts = con.execute(
+        """
+        WITH c AS (SELECT COUNT(*) AS n FROM events_all),
+        o AS (
+          SELECT Timestamp
+          FROM events_all
+          ORDER BY Timestamp
+          LIMIT 1
+          OFFSET (SELECT CAST(n * ? AS BIGINT) FROM c)
+        )
+        SELECT Timestamp FROM o
+        """,
+        [split_ratio],
     ).fetchone()[0]
+    cutoff_ts_sql = f"TIMESTAMP '{cutoff_ts}'"
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP VIEW events_train AS
+        SELECT * FROM events_all WHERE Timestamp < {cutoff_ts_sql}
+        """
+    )
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP VIEW events_valid AS
+        SELECT * FROM events_all WHERE Timestamp >= {cutoff_ts_sql}
+        """
+    )
 
     tune_rate = None
     if TUNE_PCT and 0 < TUNE_PCT <= 100:
@@ -150,20 +191,22 @@ def main():
     if eval_rate and 0 < eval_rate < 1:
         eval_predicate = f" AND random() < {eval_rate:.8f}"
 
-    # Próbka do tuningu (dobór najlepszej reguły)
+    print(f"\n  Split: train/valid = {int(split_ratio*100)}/{100-int(split_ratio*100)}; cutoff = {cutoff_ts}")
+
+    # Próbka do tuningu (dobór progów) - tylko z train
     con.execute(
         f"""
         CREATE OR REPLACE TEMP TABLE events_tune AS
         SELECT
           Timestamp,
-          try_cast(LatencyMs AS DOUBLE) AS LatencyMs,
-          try_cast(CpuUsage AS DOUBLE) AS CpuUsage,
-          try_cast(LocalQps AS DOUBLE) AS LocalQps,
-          CAST(IsSpikeByLatency AS BOOLEAN) AS IsSpikeByLatency,
-          CAST(IsSpikeByCpu AS BOOLEAN) AS IsSpikeByCpu,
-          CAST(IsSpikeByQps AS BOOLEAN) AS IsSpikeByQps
-        FROM read_parquet('{str(PARQUET_DIR)}/**/*.parquet', hive_partitioning=true)
-        WHERE LatencyMs IS NOT NULL AND CpuUsage IS NOT NULL AND LocalQps IS NOT NULL
+          LatencyMs,
+          CpuUsage,
+          LocalQps,
+          IsSpikeByLatency,
+          IsSpikeByCpu,
+          IsSpikeByQps
+        FROM events_train
+        WHERE 1=1
         {tune_predicate}
         """
     )
@@ -240,20 +283,20 @@ def main():
     ]
     # Nie wybieramy reguł na TUNE – pełny raport i wybór robimy na EVAL (ground truth)
 
-    # Zbiór do ewaluacji jakości wybranych reguł
+    # Zbiór do ewaluacji jakości wybranych reguł (tylko validation)
     con.execute(
         f"""
         CREATE OR REPLACE TEMP TABLE events_eval AS
         SELECT
           Timestamp,
-          try_cast(LatencyMs AS DOUBLE) AS LatencyMs,
-          try_cast(CpuUsage AS DOUBLE) AS CpuUsage,
-          try_cast(LocalQps AS DOUBLE) AS LocalQps,
-          CAST(IsSpikeByLatency AS BOOLEAN) AS IsSpikeByLatency,
-          CAST(IsSpikeByCpu AS BOOLEAN) AS IsSpikeByCpu,
-          CAST(IsSpikeByQps AS BOOLEAN) AS IsSpikeByQps
-        FROM read_parquet('{str(PARQUET_DIR)}/**/*.parquet', hive_partitioning=true)
-        WHERE LatencyMs IS NOT NULL AND CpuUsage IS NOT NULL AND LocalQps IS NOT NULL
+          LatencyMs,
+          CpuUsage,
+          LocalQps,
+          IsSpikeByLatency,
+          IsSpikeByCpu,
+          IsSpikeByQps
+        FROM events_valid
+        WHERE 1=1
         {eval_predicate}
         """
     )
