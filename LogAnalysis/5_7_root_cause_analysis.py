@@ -17,10 +17,10 @@ cid_sql = f"""
 SELECT CorrelationId
 FROM read_parquet('{str(PARQUET_DIR).replace("'", "''")}/**/*.parquet', hive_partitioning=true)
 WHERE EventCode IN (500, 501, 998, 999)
-    AND ScenarioStepIndex IS NOT NULL            -- wywala heartbeat/metryki z <NA>
+    AND ScenarioStepIndex IS NOT NULL            
 GROUP BY CorrelationId
-HAVING COUNT(*) >= 8                           -- ma mieć historię (wiele eventów)
-     AND COUNT(DISTINCT SourceSystem) >= 3       -- ma przejść przez wiele usług
+HAVING COUNT(*) >= 8                           -- ma mieć wiele eventow
+     AND COUNT(DISTINCT SourceSystem) >= 2       -- ma przejść przez wiele usług
 ORDER BY COUNT(*) DESC
 LIMIT 1;
 
