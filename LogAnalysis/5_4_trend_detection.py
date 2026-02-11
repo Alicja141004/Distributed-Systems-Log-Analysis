@@ -25,18 +25,17 @@ METRIC = "LatencyMs"
 
 WINDOW_MINUTES = 5
 
-MIN_R2 = 0.4
+MIN_R2 = 0.4 # współczynnik determinacji
 MIN_EVENTS_PER_WINDOW_WARN = 5
 
 # Trend logic
 MIN_SEG_WINDOWS = 6             # min 30 minut
 MAX_BAD_DIFF_RATIO = 0.10        # ~90% przyrostów dodatnich
-SPIKE_STEP_LOWER = 150
-SPIKE_STEP_UPPER = 400
+SPIKE_STD_FACTOR = 3  # ile odchyleń standardowych uznajemy za spike
 
 # Adaptive slope
 ADAPTIVE_SLOPE_PERCENTILE = 75
-ADAPTIVE_SLOPE_MIN_FLOOR = 0.2
+ADAPTIVE_SLOPE_MIN_FLOOR = 0.2 # milisekundy na minutę (ms/min)
 ADAPTIVE_SLOPE_MAX_CAP = 2.0
 
 THREADS = 8
@@ -92,7 +91,7 @@ print(df.head(5).to_string(index=False))
 if df.empty:
     raise RuntimeError("Brak danych po filtrze.")
 
-# Uzupełnienie osi czasu — BEZ interpolacji wartości
+# Uzupełnienie osi czasu 
 df = df.sort_values("time_window").set_index("time_window")
 df = df.asfreq(f"{WINDOW_MINUTES}min")
 df["n_events"] = df["n_events"].fillna(0).astype(int)
@@ -113,10 +112,10 @@ def linear_regression_time(time_windows: pd.Series, values: np.ndarray) -> tuple
     y = values.astype(float)
     model = LinearRegression()
     model.fit(X, y)
-    return float(model.coef_[0]), float(model.score(X, y))
+    return float(model.coef_[0]), float(model.score(X, y)) # slope, r2
 
 # =============================================================================
-# 3. ADAPTACYJNY PRÓG SLOPE (PRÓBKOWANIE)
+# 3. ADAPTACYJNY PRÓG SLOPE 
 # =============================================================================
 
 print("\n=== [2] ADAPTACYJNY PRÓG SLOPE ===")
@@ -141,14 +140,18 @@ adaptive_thr = min(adaptive_thr, ADAPTIVE_SLOPE_MAX_CAP)
 print(f"Adaptacyjny próg slope: {adaptive_thr:.3f} ms/min")
 
 # =============================================================================
-# 4. DETEKCJA ODCINKÓW TRENDU (SEGMENTACJA → REGRESJA)
+# 4. DETEKCJA ODCINKÓW TRENDU 
 # =============================================================================
 
 print("\n=== [3] DETEKCJA ODCINKÓW TRENDU ===")
 
 diffs = np.diff(vals)
-trend_segments = []
+mean_diff = np.mean(diffs)
+std_diff = np.std(diffs)
+spike_thr_upper = mean_diff + SPIKE_STD_FACTOR * std_diff
+spike_thr_lower = mean_diff - SPIKE_STD_FACTOR * std_diff
 
+trend_segments = []
 start = 0
 bad = 0
 count = 0
@@ -159,8 +162,8 @@ for i in range(len(diffs)):
     if diffs[i] <= 0:
         bad += 1
 
-    # spike: nagły pojedynczy skok
-    if SPIKE_STEP_LOWER <= abs(diffs[i]) <= SPIKE_STEP_UPPER:
+    # spike
+    if diffs[i] > spike_thr_upper or diffs[i] < spike_thr_lower:
         bad = count
 
     if (bad / count) > MAX_BAD_DIFF_RATIO:
@@ -272,6 +275,10 @@ SELECT
     SUM(CASE WHEN NOT pred AND NOT truth THEN 1 ELSE 0 END) AS tn
 FROM events
 """
+# TP— algorytm trafnie wykrył trend 
+# FP (False Positive) — algorytm błędnie wykrył trend 
+# FN (False Negative) — algorytm nie znalazł trendu 
+# TN (True Negative) — algorytm trafnie odrzucił trend 
 
 tp, fp, fn, tn = map(int, con.execute(confusion_sql, [SOURCE_SYSTEM]).fetchone())
 precision = tp / (tp + fp) if tp + fp else 0.0
