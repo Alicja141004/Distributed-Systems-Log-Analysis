@@ -9,77 +9,103 @@ import time
 
 THIS_DIR = Path(__file__).resolve().parent
 PARQUET_DIR = THIS_DIR / "logs_expanded_parquet"
-SAMPLE_SIZE = 250000 
+SAMPLE_SIZE = 300000 
 
-def get_cluster_label(row, stats):
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 2000)
+pd.set_option('display.max_colwidth', 50)
+
+def interpret_cluster_logic(row):
     """
-    Nadaje etykietę klastrowi w oparciu o jego statystyki względem reszty grup.
-    stats: słownik ze średnimi i odchyleniami dla całej populacji klastrów
+    Logika biznesowa interpretacji klastra na podstawie średnich wartości cech.
+    Kolejność warunków ma znaczenie!
     """
-    labels = []
+    lat = row['Avg_Lat']
+    cpu = row['Avg_CPU']
+    err = row['Avg_NetErr']
+    qps = row['Avg_QPS']
+    mem = row['Avg_Mem']
     
-    # 1. DETEKCJA AWARII (Bezwzględna)
-    # Jeśli >10% anomalii lub błędy krytyczne, to na pewno awaria.
-    if row['Anomaly_Rate'] > 10.0 or row['Top_Event'] in [500, 501, 998, 999]:
+    # 1. ANOMALY (Extr. Outliers) - sprawdzamy najpierw, żeby nie wpadło do Failure
+    # Event 999 z generatora ma np. Latency > 2000-10000ms
+    if lat > 4000:
+        return "ANOMALY (Extr. Latency)"
+    
+    # 2. CRITICAL FAILURE (System Failure)
+    # Event 500/501 - Latency boost 500-2000, Errors
+    if lat > 1000 or err > 15.0:
         return "CRITICAL FAILURE"
-    
-    # Jeśli dużo błędów sieciowych (> 5%), to problem sieciowy
-    if row['Avg_NetErr'] > 5.0:
-        return "NETWORK ISSUES"
-
-    # 2. OCENA ZASOBÓW (Relatywna - względem innych klastrów / Obliczamy Z-Score)
-    cpu_z = (row['Avg_CPU'] - stats['cpu_mean']) / stats['cpu_std'] if stats['cpu_std'] > 0 else 0
-    lat_z = (row['Avg_Latency'] - stats['lat_mean']) / stats['lat_std'] if stats['lat_std'] > 0 else 0
-    
-    # Progi dynamiczne
-    is_high_cpu = cpu_z > 0.8
-    is_high_lat = lat_z > 0.8
-    
-    if is_high_cpu and is_high_lat:
-        return "HEAVY LOAD (CPU+LAT)"
-    elif is_high_cpu:
-        return "HIGH CPU LOAD"
-    elif is_high_lat:
-        return "HIGH LATENCY (LAG)"
         
-    # 3. OCENA NORMALNEGO RUCHU
-    if row['Avg_Latency'] < stats['lat_mean']:
-        return "NORMAL (Low Traffic)"
-    else:
-        return "NORMAL (Medium Traffic)"
+    # 3. SPIKE / HEAVY LOAD
+    # CPU > 80% lub QPS > 100 (generator settings)
+    if cpu > 75.0 or qps > 150.0:
+        if lat > 300:
+            return "HEAVY LOAD (Spike+Lag)"
+        else:
+            return "HEAVY TRAFFIC (Processing)"
 
-def analyze_clusters(df, k):
-    # 1. Agregacja centroidów
+    # 4. ELEVATED LOAD
+    if cpu > 50.0 or lat > 100:
+        return "ELEVATED LOAD"
+        
+    # 5. NORMAL
+    return "NORMAL"
+
+def analyze_and_print_results(df, k):
+    print(f"\n{'#'*160}")
+    print(f" WYNIKI K-MEANS (K={k})")
+    print(f"{'#'*160}")
+
+    # Agregacja danych dla każdego klastra
     summary = df.groupby('Cluster').agg(
-        Count=('LatencyMs', 'count'),
-        Avg_Latency=('LatencyMs', 'mean'),
+        # --- CECHY TRENINGOWE (8 wymiarów) ---
+        Avg_Lat=('LatencyMs', 'mean'),
         Avg_CPU=('CpuUsage', 'mean'),
+        Avg_Mem=('MemoryUsageMb', 'mean'),
+        Avg_Disk=('DiskQueueLength', 'mean'),
         Avg_NetErr=('NetworkErrors', 'mean'),
-        Anomaly_Rate=('IsAnomaly', lambda x: np.mean(x) * 100),
-        Top_Event=('EventCode', lambda x: x.mode()[0] if not x.mode().empty else 0)
+        Avg_QPS=('LocalQps', 'mean'),
+        Avg_Req=('RequestSizeBytes', 'mean'),
+        Avg_Resp=('ResponseSizeBytes', 'mean'),
+        
+        # --- WERYFIKACJA (Ground Truth Comparison) ---
+        # 1. Anomalie i Błędy
+        IsAnom_Pct=('IsAnomaly', lambda x: np.mean(x) * 100),
+        
+        # 2. Priority Distribution (Wymagane przez Ciebie)
+        Warn_Pct=('Priority', lambda x: (x == 'warn').mean() * 100),
+        Err_Pct=('Priority', lambda x: (x == 'err').mean() * 100),
+        Crit_Pct=('Priority', lambda x: (x == 'crit').mean() * 100),
+        
+        # 3. Spike Types
+        SpikeLat_Pct=('IsSpikeByLatency', lambda x: np.mean(x) * 100),
+        SpikeCpu_Pct=('IsSpikeByCpu', lambda x: np.mean(x) * 100),
+        
+        # 4. Metadata
+        Top_Event=('EventCode', lambda x: x.mode()[0] if not x.mode().empty else 0),
+        Count=('LatencyMs', 'count')
     ).reset_index()
 
-    # 2. Obliczamy statystyki globalne dla centroidów (żeby mieć punkt odniesienia)
-    # Wykluczamy ewidentne awarie z obliczania "normy", żeby nie zawyżały średniej
-    non_failures = summary[
-        (summary['Anomaly_Rate'] < 10) & 
-        (~summary['Top_Event'].isin([500, 501, 998, 999]))
-    ]
-    
-    if non_failures.empty:
-        non_failures = summary
+    # Interpretacja
+    summary['Interpretation'] = summary.apply(interpret_cluster_logic, axis=1)
 
-    stats = {
-        'cpu_mean': non_failures['Avg_CPU'].mean(),
-        'cpu_std': non_failures['Avg_CPU'].std() or 1.0,
-        'lat_mean': non_failures['Avg_Latency'].mean(),
-        'lat_std': non_failures['Avg_Latency'].std() or 1.0
-    }
-
-    # 3. Nadajemy etykiety w pętli
-    summary['Label'] = summary.apply(lambda row: get_cluster_label(row, stats), axis=1)
+    # Formatowanie tabeli
+    print(f"{'ID':<3} | {'INTERPRETACJA':<23} | {'Count':<7} || "
+          f"{'Lat':<6} | {'CPU':<4} | {'Mem':<5} | {'Disk':<4} | {'NetE':<4} | {'QPS':<5} | {'ReqS':<5} | {'RspS':<5} || "
+          f"{'Anom%':<5} | {'Warn%':<5} | {'Err%':<4} | {'Crit%':<5} || "
+          f"{'SpikeL%':<7} | {'SpikeC%':<7} | {'Event':<5}")
+    print("-" * 160)
     
-    return summary.sort_values(by='Avg_Latency')
+    for _, row in summary.iterrows():
+        print(f"{int(row['Cluster']):<3} | {row['Interpretation']:<23} | {int(row['Count']):<7} || "
+              f"{row['Avg_Lat']:<6.0f} | {row['Avg_CPU']:<4.0f} | {row['Avg_Mem']:<5.0f} | {row['Avg_Disk']:<4.1f} | {row['Avg_NetErr']:<4.1f} | {row['Avg_QPS']:<5.0f} | {row['Avg_Req']/1000:<5.1f} | {row['Avg_Resp']/1000:<5.1f} || "
+              f"{row['IsAnom_Pct']:<5.1f} | {row['Warn_Pct']:<5.1f} | {row['Err_Pct']:<4.1f} | {row['Crit_Pct']:<5.1f} || "
+              f"{row['SpikeLat_Pct']:<7.1f} | {row['SpikeCpu_Pct']:<7.1f} | {int(row['Top_Event']):<5}")
+    
+    print("-" * 160)
+    print("LEGENDA KOLUMN:")
+    print("  Feature Vector (Avg): Lat(ms), CPU(%), Mem(MB), Disk(len), NetE(count), QPS, ReqS(kB), RspS(kB)")
+    print("  Ground Truth (%):     Anom=IsAnomaly, Warn/Err/Crit=Priority, SpikeL=IsSpikeByLatency, SpikeC=IsSpikeByCpu")
 
 def run_clustering():
     if not PARQUET_DIR.exists():
@@ -89,53 +115,57 @@ def run_clustering():
     start_time = time.time()
     con = duckdb.connect()
     parquet_path_str = str(PARQUET_DIR).replace('\\', '/')
-    parquet_query = f"read_parquet('{parquet_path_str}/**/*.parquet', hive_partitioning=true)"
-
-    print(f"Start K-Means (5.9). Pobieranie próbki {SAMPLE_SIZE} wierszy...")
-
+    
+    print(f"Start K-Means (5.9).")
+    
+    # 1. Feature Vector (8 cech)
+    feature_cols = [
+        'LatencyMs', 'CpuUsage', 'MemoryUsageMb', 'DiskQueueLength', 
+        'NetworkErrors', 'LocalQps', 'RequestSizeBytes', 'ResponseSizeBytes'
+    ]
+    
+    # 2. Ground Truth Columns (do weryfikacji)
+    meta_cols = [
+        'Priority', 'EventCode', 'IsAnomaly', 
+        'IsSpikeByLatency', 'IsSpikeByCpu', 'IsSpikeByQps'
+    ]
+    
+    select_cols = ", ".join(feature_cols + meta_cols)
+    
+    print(f"Pobieranie danych (SAMPLE={SAMPLE_SIZE})...")
+    
     query = f"""
-    SELECT 
-        LatencyMs, CpuUsage, DiskQueueLength, NetworkErrors, LocalQps,
-        EventCode, IsAnomaly
-    FROM {parquet_query}
-    WHERE LatencyMs IS NOT NULL AND CpuUsage IS NOT NULL AND ScenarioStepIndex IS NOT NULL
+    SELECT {select_cols}
+    FROM read_parquet('{parquet_path_str}/**/*.parquet', hive_partitioning=true)
+    WHERE LatencyMs IS NOT NULL AND CpuUsage IS NOT NULL
     USING SAMPLE {SAMPLE_SIZE}
     """
     
     try:
         df = con.execute(query).df()
     except Exception as e:
-        print(f"Błąd: {e}")
+        print(f"Błąd pobierania danych: {e}")
         return
 
-    print(f"Pobrano {len(df)} wierszy. Czas: {time.time()-start_time:.2f}s")
+    print(f"Pobrano {len(df)} wierszy.")
+    print(f"Trenowanie na pełnym wektorze cech: {feature_cols}")
 
-    # Standaryzacja
-    feature_cols = ['LatencyMs', 'CpuUsage', 'DiskQueueLength', 'NetworkErrors', 'LocalQps']
-    X = df[feature_cols]
+    # 3. Preprocessing
+    X = df[feature_cols].copy()
+    X = X.fillna(0) 
+    
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # PĘTLA K = [3, 5, 8]
+    # 4. K-Means Loop
     k_values = [3, 5, 8]
     
     for k in k_values:
-        print(f"\n{'='*80}")
-        print(f" ANALIZA DLA K = {k}")
-        print(f"{'='*80}")
-        
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=3)
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=5)
         df['Cluster'] = kmeans.fit_predict(X_scaled)
-        
-        summary = analyze_clusters(df, k)
-        
-        print(f"{'Clust':<5} | {'Count':<8} | {'Lat(ms)':<8} | {'CPU(%)':<6} | {'NetErr':<6} | {'Anom%':<6} | {'Event':<5} | INTERPRETACJA")
-        print("-" * 105)
-        
-        for _, row in summary.iterrows():
-            print(f"{int(row['Cluster']):<5} | {int(row['Count']):<8} | {row['Avg_Latency']:<8.1f} | {row['Avg_CPU']:<6.1f} | {row['Avg_NetErr']:<6.2f} | {row['Anomaly_Rate']:<6.1f} | {int(row['Top_Event']):<5} | {row['Label']}")
+        analyze_and_print_results(df, k)
 
-    print(f"\nCałość wykonana w: {time.time() - start_time:.2f} s")
+    print(f"\nAnaliza zakończona w: {time.time() - start_time:.2f} s")
 
 if __name__ == "__main__":
     run_clustering()
