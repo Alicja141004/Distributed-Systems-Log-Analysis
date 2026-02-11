@@ -15,7 +15,6 @@ EVAL_MAX_ROWS = 2_000_000
 EVAL_PCT_LARGE = 5.0
 
 K_SIGMA_RANGE = (1.5, 5.0, 0.5)
-PCTL_GRID = [0.95, 0.99]
 WINDOW_MINUTES = [1, 5]
 WINDOW_MULTIPLIER_GRID = [1.5, 2.0, 2.5, 3.0]
 
@@ -54,90 +53,6 @@ def frange(start: float, stop: float, step: float):
     while k <= stop + 1e-9:
         yield round(k, 3)
         k += step
-
-
-def best_rule_for_metric(
-    con: duckdb.DuckDBPyConnection,
-    metric_col: str,
-    label_col: str,
-    median_val: float,
-    mean_val: float,
-    std_val: float,
-    pctls: dict[float, float],
-    tune_view: str,
-):
-    # Kandydaci reguł progowych tylko z metryki
-    candidates = []
-
-    pred_3med = f"{metric_col} > {3 * median_val}"
-    candidates.append(("3x median", pred_3med))
-
-    for k in frange(*K_SIGMA_RANGE):
-        pred = f"{metric_col} > {mean_val + k * std_val}"
-        candidates.append((f"mean+{k:g}σ", pred))
-
-    for p, thr in pctls.items():
-        candidates.append((f"p{int(p*100):d}", f"{metric_col} >= {thr}"))
-
-    best = None
-    results = []
-    for name, pred in candidates:
-        tp, fp, fn, tn, p, r, f1 = prf1_event_level(con, pred, label_col, tune_view)
-        row = {
-            "name": name,
-            "pred": pred,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "tn": tn,
-            "p": p,
-            "r": r,
-            "f1": f1,
-        }
-        results.append(row)
-        if best is None or f1 > best["f1"]:
-            best = row
-
-    return best, results
-
-
-def window_grid_results(
-    con: duckdb.DuckDBPyConnection,
-    view_name: str,
-    metric_col: str,
-    label_col: str,
-):
-    # Kandydaci reguł okienkowych (porównanie okien czasowych)
-    results = []
-    for w in WINDOW_MINUTES:
-        for mult in WINDOW_MULTIPLIER_GRID:
-            tp, fp, fn, tn, p, r, f1 = prf1_metric_windows(
-                con, metric_col, label_col, w, mult, view_name
-            )
-            results.append(
-                {
-                    "name": f"window {w}m x{mult:g}",
-                    "pred": None,
-                    "tp": tp,
-                    "fp": fp,
-                    "fn": fn,
-                    "tn": tn,
-                    "p": p,
-                    "r": r,
-                    "f1": f1,
-                    "window": (w, mult),
-                }
-            )
-    return results
-
-
-def best_of(a, b):
-    # Wybór najlepszego po F1
-    best = a
-    for row in b:
-        if row["f1"] > best["f1"]:
-            best = row
-    return best
 
 
 def prf1_metric_windows(
@@ -203,12 +118,10 @@ def main():
     print("  5.3 WYKRYWANIE SPIKE'OW (bez flag IsSpike* i SpikeWindow)")
     print("=" * 70)
 
-    # DuckDB na parquetach jest szybkie i skaluje się na duże dane
     con = duckdb.connect()
     con.execute("PRAGMA threads=?", [THREADS])
     con.execute("PRAGMA memory_limit=?", [f"{MEMORY_LIMIT_GB}GB"])
 
-    print("\n[1/4] Wczytywanie danych...")
     # Liczba wierszy -> decyzja czy ewaluacja na całych danych czy próbce
     total_rows = con.execute(
         f"""
@@ -228,7 +141,6 @@ def main():
         eval_pct_effective = EVAL_PCT_LARGE
     if eval_pct_effective and 0 < eval_pct_effective <= 100:
         eval_rate = eval_pct_effective / 100.0
-        label = "wszystkie dane" if eval_pct_effective == 100 else f"{eval_pct_effective:.2f}%"
 
     tune_predicate = ""
     if tune_rate and 0 < tune_rate < 1:
@@ -264,7 +176,7 @@ def main():
     )
 
 
-    print("\n[2/4] Statystyki...")
+    print("\n[1] Statystyki...")
     # Statystyki dla progów (mean/median/std + percentyle)
     stats = con.execute(
         """
@@ -307,9 +219,18 @@ def main():
         qps_p95, qps_p99,
     ) = map(float, stats)
 
-    print(f"  Latency: mean={lat_mean:.2f}, median={lat_med:.2f}, std={lat_std:.2f}")
-    print(f"  CPU:     mean={cpu_mean:.2f}, median={cpu_med:.2f}, std={cpu_std:.2f}")
-    print(f"  QPS:     mean={qps_mean:.2f}, median={qps_med:.2f}, std={qps_std:.2f}")
+    print(
+        f"  Latency: mean={lat_mean:.2f}, median={lat_med:.2f}, std={lat_std:.2f}, "
+        f"p95={lat_p95:.2f}, p99={lat_p99:.2f}"
+    )
+    print(
+        f"  CPU:     mean={cpu_mean:.2f}, median={cpu_med:.2f}, std={cpu_std:.2f}, "
+        f"p95={cpu_p95:.2f}, p99={cpu_p99:.2f}"
+    )
+    print(
+        f"  QPS:     mean={qps_mean:.2f}, median={qps_med:.2f}, std={qps_std:.2f}, "
+        f"p95={qps_p95:.2f}, p99={qps_p99:.2f}"
+    )
 
     # Wspólna ścieżka dla Latency/CPU/QPS
     metrics = [
@@ -317,14 +238,7 @@ def main():
         ("CPU", "CpuUsage", "IsSpikeByCpu", cpu_med, cpu_mean, cpu_std, cpu_p95, cpu_p99),
         ("QPS", "LocalQps", "IsSpikeByQps", qps_med, qps_mean, qps_std, qps_p95, qps_p99),
     ]
-    best_map = {}
-    for name, col, label, med, mean, std, p95, p99 in metrics:
-        pctls = {0.95: p95, 0.99: p99}
-        best_rule, _ = best_rule_for_metric(
-            con, col, label, med, mean, std, pctls, "events_tune_v"
-        )
-        win = window_grid_results(con, "events_tune_v", col, label)
-        best_map[name] = best_of(best_rule, win)
+    # Nie wybieramy reguł na TUNE – pełny raport i wybór robimy na EVAL (ground truth)
 
     # Zbiór do ewaluacji jakości wybranych reguł
     con.execute(
@@ -350,23 +264,39 @@ def main():
         """
     )
 
-    # Końcowy raport PRF1
-    print("\n[4/4] Raport PRF1 dla najlepszych reguł na zbiorze ewaluacyjnym:")
-    print(f"{'Metryka':<10} {'Reguła':<14} {'Prec':>7} {'Rec':>7} {'F1':>7} {'TP':>10} {'FP':>10} {'FN':>10} {'TN':>10}")
-    print("-" * 86)
-    for name, col, label, *_ in metrics:
-        best = best_map[name]
-        if best.get("pred"):
-            tp, fp, fn, tn, p, r, f1 = prf1_event_level(
-                con, best["pred"], label, "events_eval_v"
-            )
-        else:
-            w, mult = best["window"]
-            tp, fp, fn, tn, p, r, f1 = prf1_metric_windows(
-                con, col, label, w, mult, "events_eval_v"
-            )
+    best_rows = []
+    for name, col, label, med, mean, std, p95, p99 in metrics:
+        candidates = []
+        candidates.append(("3x median", f"{col} > {3 * med}"))
+        for k in frange(*K_SIGMA_RANGE):
+            candidates.append((f"mean+{k:g}σ", f"{col} > {mean + k * std}"))
+        candidates.append(("p95", f"{col} >= {p95}"))
+        candidates.append(("p99", f"{col} >= {p99}"))
+
+        best = None
+        for rule_name, pred in candidates:
+            tp, fp, fn, tn, p, r, f1 = prf1_event_level(con, pred, label, "events_eval_v")
+            if best is None or f1 > best[4]:
+                best = (name, rule_name, p, r, f1, tp, fp, fn, tn)
+
+        for w in WINDOW_MINUTES:
+            for mult in WINDOW_MULTIPLIER_GRID:
+                tp, fp, fn, tn, p, r, f1 = prf1_metric_windows(
+                    con, col, label, w, mult, "events_eval_v"
+                )
+                rule_name = f"window {w}m x{mult:g}"
+                if best is None or f1 > best[4]:
+                    best = (name, rule_name, p, r, f1, tp, fp, fn, tn)
+
+        if best is not None:
+            best_rows.append(best)
+
+    print("\n[2] Najlepsza reguła per metryka (max F1):")
+    print(f"{'Metryka':<10} {'Reguła':<16} {'Prec':>7} {'Rec':>7} {'F1':>7} {'TP':>10} {'FP':>10} {'FN':>10} {'TN':>10}")
+    print("-" * 92)
+    for name, rule_name, p, r, f1, tp, fp, fn, tn in best_rows:
         print(
-            f"{name:<10} {best['name']:<14} {p:>7.3f} {r:>7.3f} {f1:>7.3f} "
+            f"{name:<10} {rule_name:<16} {p:>7.3f} {r:>7.3f} {f1:>7.3f} "
             f"{tp:>10,} {fp:>10,} {fn:>10,} {tn:>10,}"
         )
 
