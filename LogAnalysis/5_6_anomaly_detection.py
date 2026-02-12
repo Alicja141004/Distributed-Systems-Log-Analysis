@@ -69,7 +69,7 @@ def main():
     df['DiskStress'] = df['DiskQueueLength'] / (df['LogQps'] + eps)
     
     # Ile QPS uzyskujemy z jednostki CPU - ekstremalnie niska lub wysoka wartość to sygnał anomalii
-    df['CpuEfficiency'] = df['LogQps'] / (df['CpuUsage'] + eps)
+    df['CpuEfficiency'] = df['LocalQps'] / (df['CpuUsage'])
 
    # Wysoki latency przy niskim QPS ("stall") vs wysoki latency przy wysokim QPS (obciążenie)
     df['LatencyPerQps'] = df['LogLatency'] / (df['LogQps'] + eps)
@@ -79,9 +79,9 @@ def main():
 
     # Wybór ostatecznych cech
     features = [
-        'LogLatency',
+        'LatencyMs',
         'CpuUsage',
-        'LogQps',
+        'LocalQps',
         'ErrorRate',
         'DiskStress',
         'CpuEfficiency',
