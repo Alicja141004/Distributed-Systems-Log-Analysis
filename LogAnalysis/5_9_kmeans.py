@@ -9,7 +9,7 @@ import time
 
 THIS_DIR = Path(__file__).resolve().parent
 PARQUET_DIR = THIS_DIR / "logs_expanded_parquet"
-SAMPLE_SIZE = 300000 
+SAMPLE_SIZE = 500000 
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 2000)
