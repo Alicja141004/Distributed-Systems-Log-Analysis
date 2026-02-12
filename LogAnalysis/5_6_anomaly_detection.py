@@ -6,14 +6,14 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
-PARQUET_DIR = THIS_DIR / "logs_expanded_parquet" # LogAnalysis/logs_expanded_parquet
+PARQUET_DIR = THIS_DIR / "logs_expanded_parquet"
 
 SAMPLE_SIZE = 500_000
 SAMPLE_SEED = 42
 
 # Zasoby DuckDB
 MEMORY_LIMIT_GB = 16
-THREADS = 1 # Gwarancja powtarzalności przy REPEATABLE
+THREADS = 1
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
     con.execute("PRAGMA threads=?", [THREADS])
     con.execute("PRAGMA memory_limit=?", [f"{MEMORY_LIMIT_GB}GB"])
     
-    # 1. Pobranie danych (wybranie kolumn numerycznych do wektora cech + flagi i kodu WYŁĄCZNIE do weryfikacji)
+    # 1. Wybranie kolumn numerycznych do wektora cech + flagi i kodu WYŁĄCZNIE do weryfikacji)
     # Pobranie próbki losowej, aby nie zapchać RAM przy uczeniu modelu, ale wystarczająco dużą, by złapać rzadkie anomalie
     print(f"[1/5] Pobieranie danych (próbka {SAMPLE_SIZE} wierszy)...")
 
@@ -51,38 +51,30 @@ def main():
     n_actual = ((df['IsAnomaly'] == 1) | (df['EventCode'].isin([998, 999]))).sum()
     print(f"  Wierszy: {len(df):,}  |  Rzeczywiste anomalie w próbce: {n_actual}")
 
-    # 2. Feature Engineering (logiczne podejście - wykryć anomalie PO CHARAKTERYSTYCE wielowymiarowej, nie po etykietach)
-    # Isolation Forest znajdzie punkty izolowane w przestrzeni cech
+    # 2. Feature Engineering
+    # Cechy interakcyjne kodują RELACJE między metrykami, co pozwala IF lepiej separować wielowymiarowe outliery niż surowe wartości
     print("[2/5] Budowanie wektora cech...")
     
-    # A. Logarytmy dla rozkładów potęgowych
     df['LogLatency'] = np.log1p(df['LatencyMs'])
     df['LogReqSize'] = np.log1p(df['RequestSizeBytes'])
     df['LogRespSize'] = np.log1p(df['ResponseSizeBytes'])
     df['LogQps'] = np.log1p(df['LocalQps'])
 
-    # B. Cechy interakcyjne - kodują RELACJE między metrykami
-    # Celem jest odróżnić różne typy odstających eventów
     eps = 1e-6
     
-    # 1. ErrorRate - czy błędy sieciowe są proporcjonalne do ruchu?
-    # Event z dużą liczbą błędów przy niskim ruchu jest bardziej podejrzany
+    # Stosunek błędów sieciowych do ruchu - dużo błędów przy niskim QPS jest bardziej podejrzane
     df['ErrorRate'] = df['NetworkErrors'] / (df['LogQps'] + eps)
     
-    # 2. DiskStress - kolejka dysku w relacji do ruchu
-    # Duża kolejka przy niskim QPS sugeruje problem wydajnościowy inny niż zwykłe obciążenie
+    # # Kolejka dysku w relacji do ruchu - wysoka kolejka przy niskim QPS sugeruje problem inny niż obciążenie 
     df['DiskStress'] = df['DiskQueueLength'] / (df['LogQps'] + eps)
     
-    # 3. CpuEfficiency - ile QPS uzyskujemy z jednostki CPU?
-    # Event z ekstremalnym CPU (bardzo niskim lub bardzo wysokim) przy nietypowym QPS będzie miał odstającą wartość tej cechy
+    # Ile QPS uzyskujemy z jednostki CPU - ekstremalnie niska lub wysoka wartość to sygnał anomalii
     df['CpuEfficiency'] = df['LogQps'] / (df['CpuUsage'] + eps)
 
-    # 4. LatencyPerQps - wysoki latency przy niskim QPS ("stall") vs wysoki latency przy wysokim QPS (obciążenie)
-    # Ta cecha separuje te dwa zjawiska
+   # Wysoki latency przy niskim QPS ("stall") vs wysoki latency przy wysokim QPS (obciążenie)
     df['LatencyPerQps'] = df['LogLatency'] / (df['LogQps'] + eps)
 
-    # 5. Anomalie mają ekstremalny RequestSize (1-100 LUB 50k-200k)
-    # Stosunek req/resp - anomalie mają nietypowe proporcje
+    # Stosunek rozmiaru request/response - nietypowe proporcje mogą wskazywać na outliery
     df['SizeRatio'] = df['LogReqSize'] / (df['LogRespSize'] + eps)
 
     # Wybór ostatecznych cech
@@ -101,10 +93,10 @@ def main():
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # 3. Modelowanie (najlepsze parametry z eksperymentów)
+    # 3. Modelowanie
     print("[3/5] Trenowanie modelu Isolation Forest...")
     
-    # Parametry dobrane eksperymentalnie (duża próbka kluczowa dla jakości)
+    # Parametry dobrane eksperymentalnie
     iso_forest = IsolationForest(
         n_estimators=300,
         max_samples=8192, 
@@ -116,28 +108,47 @@ def main():
     scores = iso_forest.decision_function(X_scaled)
     df['AnomalyScore'] = scores
     
+    # Kolumna ground truth (TYLKO do ewaluacji)
+    df['ActualAnomaly'] = ((df['IsAnomaly'] == 1) | (df['EventCode'].isin([998, 999]))).astype(int)
+    
     # 4. Dynamiczny próg
     print("[4/5] Wyznaczanie progu (dynamic separation)...")
     
-    # Szukanie "luki" w ogonie rozkładu score'ów
-    # Jeśli anomalie są dobrze izolowane, między nimi a resztą będzie przerwa w score'ach
-    p01 = np.percentile(scores, 0.1) 
+    # Dynamic Separation - szukanie luki w dolnym ogonie rozkładu score'ów
+    # Guardrails - alarm rate ograniczony do 0.01%–1%
+    p001 = np.percentile(scores, 0.01)
+    p01 = np.percentile(scores, 0.1)
     p05 = np.percentile(scores, 0.5)
+    p1 = np.percentile(scores, 1.0)
     
-    # Jeśli jest wyraźna separacja, użyty zostanie dynamiczny próg. Jeśli nie, fallback na 0.2%.
     if p05 - p01 > 0.05:
         threshold = p01 + (p05 - p01) * 0.3
         method_name = "Dynamic Separation"
     else:
-        threshold = np.percentile(scores, 0.2)
-        method_name = "Percentile 0.2% (fallback)"
+        # Brak wyraźnej separacji - fallback na percentyl 0.5% wszystkich score'ów
+        threshold = np.percentile(scores, 0.5)
+        method_name = "Percentile Fallback (p=0.5%)"
 
+    # Guardrails - ograniczenie alarm rate do rozsądnego zakresu
+    if threshold > p1:
+        threshold = p1
+        method_name += " + GuardMax(p1)"
+    if threshold < p001:
+        threshold = p001
+        method_name += " + GuardMin(p0.01)"
+
+    # Diagnostyka progów
+    n_alarms = (scores < threshold).sum()
+    alarm_pct = n_alarms / len(scores) * 100
+    print(f"  p0.01={p001:.4f}  p0.1={p01:.4f}  p0.5={p05:.4f}  p1={p1:.4f}")
+    print(f"  Wybrany próg: {threshold:.4f} ({method_name})")
+    print(f"  Oczekiwanych alarmów: {n_alarms:,} ({alarm_pct:.2f}%)")
+    
     df['PredictedAnomaly'] = np.where(df['AnomalyScore'] < threshold, 1, 0)
 
     # 5. Wyniki (ewaluacja)
     print("[5/5] Ewaluacja wyników...")
     
-    df['ActualAnomaly'] = ((df['IsAnomaly'] == 1) | (df['EventCode'].isin([998, 999]))).astype(int)
     y_true = df['ActualAnomaly']
     y_pred = df['PredictedAnomaly']
     
@@ -168,9 +179,16 @@ def main():
     print(f"  Wykryto {detected} z {total_anomalies} anomalii ({recall:.1%}).")
     print(f"  Alarmów łącznie: {total_alarms}, z czego {false_alarms} fałszywych.")
     if detected > 0:
-        print(f"  FP/TP ratio: {false_alarms / detected:.1f}")
-        print(f"  -> Oznacza to, że na każdą prawdziwą anomalię przypada {false_alarms / detected:.1f} fałszywych alarmów.")
-        print(f"  -> Metoda jest skuteczna w wykrywaniu anomalii, ale generuje relatywnie wysoką liczbę fałszywych alarmów, co jest typowe dla nienadzorowanych metod detekcji anomalii. Wysoka liczba FP wynika prawdopodobnie z wykrywania zdarzeń typu 'Failure' oraz silnych 'Spike', które statystycznie są anomaliami, mimo braku etykiety 'IsAnomaly'.")
+        fp_ratio = false_alarms / detected
+        print(f"  FP/TP ratio: {fp_ratio:.1f}")
+    if false_alarms == 0 and detected > 0:
+        print(f"  -> Model ma idealną precyzję (brak fałszywych alarmów).")
+    if recall < 0.5:
+        print(f"  -> UWAGA: Recall poniżej 50% - model wykrywa tylko najsilniejsze anomalie.")
+    elif recall >= 0.8:
+        print(f"  -> Dobry recall - model wykrywa większość anomalii.")
+    if false_alarms > 0:
+        print(f"  -> FP wynikają prawdopodobnie z wykrywania zdarzeń typu 'Failure' oraz silnych 'Spike', które statystycznie są anomaliami, mimo braku etykiety 'IsAnomaly'.")
 
     # 6. Minimalna walidacja
     print("\n" + "=" * 60)
