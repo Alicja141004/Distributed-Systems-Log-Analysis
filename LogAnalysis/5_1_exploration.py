@@ -12,7 +12,8 @@ PARQUET_DIR = THIS_DIR / "logs_expanded_parquet"
 OUTPUT_IMG_DIR = THIS_DIR / "wyniki_analizy_img"
 
 sns.set_theme(style="whitegrid", context="talk")
-plt.rcParams['figure.figsize'] = (16, 10)
+plt.rcParams['figure.figsize'] = (20, 12)
+plt.rcParams['figure.dpi'] = 100
 
 def setup_dirs():
     if not PARQUET_DIR.exists():
@@ -28,12 +29,10 @@ def save_plot(fig, filename):
     print(f"Wygenerowano wykres: {path.name}")
 
 def print_text_stats(con, parquet_query):
-    """Wypisuje statystyki tekstowe do konsoli (wymagane w zadaniu 5.1)"""
     print("\n" + "="*80)
     print(" 5.1 EKSPLORACJA DANYCH - RAPORT TEKSTOWY")
     print("="*80)
 
-    # 1. Podstawowe liczniki
     stats_sql = f"""
     SELECT 
         COUNT(*) as total_events,
@@ -53,9 +52,7 @@ def print_text_stats(con, parquet_query):
     print(f"Liczba systemów:  {stats[3]}")
     print("-" * 80)
 
-    # 2. Rozkłady
     columns_to_analyze = ["Priority", "EventCode", "SourceSystem", "Scenario"]
-    
     for col in columns_to_analyze:
         print(f"\nRozkład: {col} (Top 10)")
         sql = f"""
@@ -67,38 +64,42 @@ def print_text_stats(con, parquet_query):
         LIMIT 10
         """
         df = con.execute(sql).df()
-        # Formatowanie tabeli
         print(f"{col:<30} | {'Count':>10} | {'%':>6}")
         print("-" * 52)
         for _, row in df.iterrows():
             val = str(row[col])
-            # Skracanie zbyt długich nazw
             if len(val) > 28: val = val[:25] + "..."
             print(f"{val:<30} | {row['Count']:>10,} | {row['Pct']:>6.2f}%")
-
     print("\n" + "="*80)
 
+def human_format(num, pos=None):
+    # Formatowanie dużych liczb
+    magnitude = 0
+    while abs(num) >= 1000:
+        magnitude += 1
+        num /= 1000.0
+    return '%.1f%s' % (num, ['', 'k', 'M', 'G'][magnitude])
 
 def plot_summary_dashboard(con, parquet_query):
-    """Grafika 1: Podsumowanie liczbowe i rozkłady (Top 10)"""
-    print("Generowanie dashboardu podsumowującego (wykres)...")
-    fig = plt.figure(figsize=(18, 12))
-    gs = fig.add_gridspec(3, 2, height_ratios=[0.4, 2, 2])
+    print("Generowanie dashboardu podsumowującego (czytelne osie)...")
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(3, 2, height_ratios=[0.3, 2, 2])
 
-    # Nagłówek
     ax_text = fig.add_subplot(gs[0, :])
     ax_text.axis('off')
     ax_text.text(0.5, 0.5, "ANALIZA STRUKTURY LOGÓW (5.1)", 
                  ha='center', va='center', fontsize=24, fontweight='bold', color='#2c3e50')
 
-    # Wykresy słupkowe
     distributions = ["Priority", "EventCode", "SourceSystem", "Scenario"]
     grid_positions = [(1, 0), (1, 1), (2, 0), (2, 1)]
     colors = ["#3498db", "#e74c3c", "#9b59b6", "#2ecc71"]
     
+    log_scale_cols = ["Priority", "EventCode"]
+
     for i, col in enumerate(distributions):
         sql = f"""
-        SELECT {col}, COUNT(*) as Count
+        SELECT {col}, COUNT(*) as Count,
+               COUNT(*) * 100.0 / (SELECT COUNT(*) FROM {parquet_query}) as Pct
         FROM {parquet_query}
         GROUP BY {col} 
         ORDER BY Count DESC
@@ -108,18 +109,36 @@ def plot_summary_dashboard(con, parquet_query):
         df_dist[col] = df_dist[col].astype(str)
 
         ax = fig.add_subplot(gs[grid_positions[i]])
+        
         sns.barplot(data=df_dist, x="Count", y=col, ax=ax, color=colors[i])
-        ax.set_title(f"Top 10: {col}")
-        ax.set_xlabel("")
+        
+        # Konfiguracja skali i osi
+        if col in log_scale_cols:
+            ax.set_xscale("log")
+            ax.set_title(f"Top 10: {col} (Log Scale)", fontweight='bold', fontsize=16)
+            ax.set_xlim(right=df_dist['Count'].max() * 5)
+        else:
+            ax.set_title(f"Top 10: {col}", fontweight='bold', fontsize=16)
+            ax.set_xlim(right=df_dist['Count'].max() * 1.25)
+            
+            ax.xaxis.set_major_formatter(ticker.FuncFormatter(human_format))
+            ax.tick_params(axis='x', rotation=15)
+
+        ax.set_xlabel("Liczba zdarzeń", fontsize=12)
         ax.set_ylabel("")
+        ax.tick_params(axis='y', labelsize=12)
+
+        for index, row in df_dist.iterrows():
+            label = f" {int(row['Count']):,} ({row['Pct']:.1f}%)"
+            ax.text(row['Count'], index, label, va='center', fontsize=11, fontweight='bold', color='#333333')
 
     plt.tight_layout()
     save_plot(fig, "1_dashboard_podsumowanie.png")
 
 def plot_histograms_dashboard(con, parquet_query):
-    """Grafika 2: Histogramy z LOGARYTMICZNĄ SKALĄ"""
+    """Grafika 2: Histogramy"""
     print("Generowanie dashboardu histogramów...")
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(20, 14))
     axes = axes.flatten()
 
     hist_configs = [
@@ -144,15 +163,18 @@ def plot_histograms_dashboard(con, parquet_query):
 
         if not df_hist.empty:
             ax.bar(df_hist['BucketStart'], df_hist['Count'], width=bucket*0.9, color=color, align='edge', alpha=0.85)
+            
             if use_log:
                 ax.set_yscale('log')
-                ax.set_title(f"{col} (Log Scale)", fontweight='bold')
+                ax.set_title(f"{col} (Log Scale)", fontweight='bold', fontsize=15)
             else:
-                ax.set_title(f"{col}", fontweight='bold')
-            ax.set_xlabel(f"{col} (Bucket={bucket})")
+                ax.set_title(f"{col}", fontweight='bold', fontsize=15)
+                ax.yaxis.set_major_formatter(ticker.FuncFormatter(human_format))
+
+            ax.set_xlabel(f"{col} (Bucket={bucket})", fontsize=12)
             ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
             
-    fig.suptitle('Rozkłady metryk numerycznych', fontsize=20, y=0.98)
+    fig.suptitle('Rozkłady metryk numerycznych', fontsize=22, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     save_plot(fig, "2_dashboard_histogramy.png")
 
@@ -165,7 +187,7 @@ def run_exploration():
     parquet_path_str = str(PARQUET_DIR).replace('\\', '/')
     parquet_query = f"read_parquet('{parquet_path_str}/**/*.parquet', hive_partitioning=true)"
 
-    # 1. Statystyki tekstowe (NOWE)
+    # 1. Statystyki tekstowe
     print_text_stats(con, parquet_query)
 
     # 2. Wykresy
