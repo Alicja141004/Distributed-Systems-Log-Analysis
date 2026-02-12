@@ -14,7 +14,7 @@ METRICS_CONFIG = {
     "DiskQueueLength":   {"scale_log": True}, # Log - (~0-1 - 50-300+)
     "RequestSizeBytes":  {"scale_log": True},  # Log - (~1-100 - 50000-200000+ bytes)
     "ResponseSizeBytes": {"scale_log": True}, # Log - (~1-100 - 50000-200000+ bytes)
-    "LocalQps":          {"scale_log": False}, # Lin - (~10-50 - 100-500+), widać górki normalne vs spike
+    "LocalQps":          {"scale_log": True}, # Log - (~10-50 - 100-500+)
     "CpuUsage":          {"scale_log": False}, # Lin - (0-100%), stały zakres
     "NetworkErrors":     {"scale_log": False}  # Lin - (0 - kilka+)
 }
@@ -305,9 +305,18 @@ def main():
 
     print("\n[6/6] Generowanie wykresu porównawczego...")
     
+    def fmt_num(n):
+        if n < 10:
+            return f"{n:.2f}"
+        return f"{int(n)}"
+    
     bucket_labels = {}
     for i in range(len(bins) - 1):
-        bucket_labels[i + 1] = f"{i + 1}\n({int(bins[i])}-{int(bins[i + 1])})"
+        low_label = fmt_num(bins[i])
+        high_label = fmt_num(bins[i+1])
+        if i == 0 and USE_LOG_SCALE and min_val == 1:
+            pass
+        bucket_labels[i + 1] = f"{i + 1}\n({low_label}-{high_label})"
 
     plot_data = []
     for state in order:
