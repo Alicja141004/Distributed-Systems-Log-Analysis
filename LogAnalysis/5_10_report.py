@@ -26,7 +26,7 @@ Cel: Dla zespołu IT/DevOps.
 Format: Markdown.
 
 Struktura:
-1. **Diagnoza (3-4 zdania):** Executive summary - stan systemu (zdrowy / zdegradowany / krytyczny). Skala problemów. Eksplorację danych oraz analizę statystyczną potraktuj bardziej jako sugestię/"ground truth".
+1. **Diagnoza (3-4 zdania):** Executive summary - stan systemu (zdrowy / zdegradowany / krytyczny). Skala problemów. Wykorzystaj liczniki z zadania 5.1 do określenia wielkości ruchu.
 2. **Top 3 problemy:** Każdy z: Co? Gdzie (serwis)? Dowód liczbowy (cytuj konkretne wartości z outputów).
 3. **Łańcuch przyczynowy (RCA):** Na podstawie zadania 5.7 (Trace) i 5.5 (Propagacja): Który system zawiódł pierwszy? Jak awaria przepłynęła przez system (ścieżka)?
 4. **Środki zaradcze (3-5 punktów):** Konkretne akcje powiązane z wykrytymi problemami.
@@ -50,14 +50,15 @@ Struktura:
 - Format: Markdown
 
 ## WSKAZÓWKI — NA CO GŁÓWNIE ZWRÓCIĆ UWAGĘ W DANYCH:
-- Task 5.2: tabela WYNIKI ze statystykami per stan (NORMAL/SPIKE/FAILURE/ANOMALY) — kluczowe metryki
-- Task 5.3: tabela PRF1 — skuteczność wykrywania spike'ów
-- Task 5.4: wykryte segmenty trendu, slope, Precision/Recall
-- Task 5.5: progi failure, PRF1 per label, propagacja między systemami
-- Task 5.6: Precision/Recall/F1 anomaly detection, confusion matrix
-- Task 5.7: ścieżka przejścia systemów, root cause event, look-back
-- Task 5.8: F1 predykcji awarii, MAE regresji, F1 predykcji sekwencyjnej
-- Task 5.9: interpretacja klastrów K-Means (NORMAL / NETWORK ISSUES / CRITICAL FAILURE)
+- Task 5.1: Raport tekstowy — całkowita liczba zdarzeń i transakcji (skala), rozkład procentowy Priority (ile % crit/warn) oraz EventCode.
+- Task 5.2: tabela WYNIKI ze statystykami per stan (NORMAL/SPIKE/FAILURE/ANOMALY) — kluczowe metryki.
+- Task 5.3: tabela PRF1 — skuteczność wykrywania spike'ów.
+- Task 5.4: wykryte segmenty trendu, slope, Precision/Recall.
+- Task 5.5: progi failure, PRF1 per label, propagacja między systemami.
+- Task 5.6: Precision/Recall/F1 anomaly detection, confusion matrix.
+- Task 5.7: ścieżka przejścia systemów, root cause event, look-back.
+- Task 5.8: F1 predykcji awarii, MAE regresji, F1 predykcji sekwencyjnej.
+- Task 5.9: Interpretacja klastrów K-Means. Zwróć uwagę na różnicę między "HEAVY LOAD" (wysokie CPU/QPS, ale system działa) a "CRITICAL FAILURE" (wysokie Latency/Błędy). Sprawdź kolumny 'SpikeC%' oraz 'Crit%' w tabeli klastrów, aby potwierdzić naturę problemu.
 - Jeżeli w tasku podano logiczne wnioski wyjaśniające, weź je pod uwagę.
 
 ## DANE WEJŚCIOWE (z analizy logów - outputy zadań 5.1-5.9):
